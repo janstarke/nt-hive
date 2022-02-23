@@ -14,7 +14,7 @@ use core::ops::{Deref, Range};
 use core::ptr;
 use enumn::N;
 use memoffset::offset_of;
-use zerocopy::*;
+use binread::{BinRead, BinReaderExt};
 
 #[cfg(feature = "alloc")]
 use {alloc::string::String, alloc::vec::Vec, core::char, core::iter};
@@ -31,7 +31,7 @@ bitflags! {
 
 /// Zero-copy representation of raw Key Value data, returned by [`KeyValue::data`].
 #[derive(Clone)]
-pub enum KeyValueData<'a, B: ByteSlice> {
+pub enum KeyValueData<'a, B: BinReaderExt> {
     /// The data fits into a single cell.
     /// Contains the contiguous range of data bytes.
     Small(&'a [u8]),
@@ -42,7 +42,7 @@ pub enum KeyValueData<'a, B: ByteSlice> {
 
 impl<'a, B> KeyValueData<'a, B>
 where
-    B: ByteSlice,
+    B:BinReaderExt
 {
     #[cfg(feature = "alloc")]
     pub fn into_vec(self) -> Result<Vec<u8>> {
@@ -82,16 +82,16 @@ pub enum KeyValueDataType {
 
 /// On-Disk Structure of a Key Value header.
 #[allow(dead_code)]
-#[derive(AsBytes, FromBytes, Unaligned)]
+#[derive(BinRead)]
 #[repr(packed)]
 struct KeyValueHeader {
     signature: [u8; 2],
-    name_length: U16<LittleEndian>,
-    data_size: U32<LittleEndian>,
-    data_offset: U32<LittleEndian>,
-    data_type: U32<LittleEndian>,
-    flags: U16<LittleEndian>,
-    spare: U16<LittleEndian>,
+    name_length: u16,
+    data_size: u32,
+    data_offset: u32,
+    data_type: u32,
+    flags: u16,
+    spare: u16,
 }
 
 /// A single value that belongs to a [`KeyNode`].
@@ -101,7 +101,7 @@ struct KeyValueHeader {
 ///
 /// [`KeyNode`]: crate::key_node::KeyNode
 #[derive(Clone)]
-pub struct KeyValue<H: Deref<Target = Hive<B>>, B: ByteSlice> {
+pub struct KeyValue<H: Deref<Target = Hive<B>>, B: BinReaderExt> {
     hive: H,
     header_range: Range<usize>,
     data_range: Range<usize>,
@@ -110,7 +110,7 @@ pub struct KeyValue<H: Deref<Target = Hive<B>>, B: ByteSlice> {
 impl<H, B> KeyValue<H, B>
 where
     H: Deref<Target = Hive<B>>,
-    B: ByteSlice,
+    B:BinReaderExt
 {
     pub(crate) fn new(hive: H, cell_range: Range<usize>) -> Result<Self> {
         let header_range = byte_subrange(&cell_range, mem::size_of::<KeyValueHeader>())
@@ -131,8 +131,10 @@ where
         Ok(key_value)
     }
 
-    fn header(&self) -> LayoutVerified<&[u8], KeyValueHeader> {
-        LayoutVerified::new(&self.hive.data[self.header_range.clone()]).unwrap()
+    fn header(&self) -> KeyValueHeader {
+        // FIXME: delete the following statement
+        //LayoutVerified::new(&self.hive.data[self.header_range.clone()]).unwrap()
+        self.data.hive[self.header_range.clone()].read_le().unwrap()
     }
 
     /// Returns the raw data bytes as [`KeyValueData`].
@@ -445,7 +447,7 @@ where
 
 impl<B> PartialEq for KeyValue<&Hive<B>, B>
 where
-    B: ByteSlice,
+    B:BinReaderExt
 {
     fn eq(&self, other: &Self) -> bool {
         ptr::eq(self.hive, other.hive)
@@ -454,7 +456,7 @@ where
     }
 }
 
-impl<B> Eq for KeyValue<&Hive<B>, B> where B: ByteSlice {}
+impl<B> Eq for KeyValue<&Hive<B>, B> where B:BinReaderExt{}
 
 #[cfg(test)]
 mod tests {

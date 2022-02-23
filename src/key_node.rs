@@ -10,13 +10,12 @@ use crate::key_values_list::KeyValues;
 use crate::leaf::{LeafItemRange, LeafItemRanges};
 use crate::string::NtHiveNameString;
 use crate::subkeys_list::{SubKeyNodes, SubKeyNodesMut};
-use ::byteorder::LittleEndian;
 use bitflags::bitflags;
 use core::cmp::Ordering;
 use core::mem;
 use core::ops::{Deref, DerefMut, Range};
 use core::ptr;
-use zerocopy::*;
+use binread::{BinRead, BinReaderExt};
 
 bitflags! {
     struct KeyNodeFlags: u16 {
@@ -45,29 +44,29 @@ bitflags! {
 
 /// On-Disk Structure of a Key Node header.
 #[allow(dead_code)]
-#[derive(AsBytes, FromBytes, Unaligned)]
+#[derive(BinRead)]
 #[repr(packed)]
 struct KeyNodeHeader {
     signature: [u8; 2],
-    flags: U16<LittleEndian>,
-    timestamp: U64<LittleEndian>,
-    spare: U32<LittleEndian>,
-    parent: U32<LittleEndian>,
-    subkey_count: U32<LittleEndian>,
-    volatile_subkey_count: U32<LittleEndian>,
-    subkeys_list_offset: U32<LittleEndian>,
-    volatile_subkeys_list_offset: U32<LittleEndian>,
-    key_values_count: U32<LittleEndian>,
-    key_values_list_offset: U32<LittleEndian>,
-    key_security_offset: U32<LittleEndian>,
-    class_name_offset: U32<LittleEndian>,
-    max_subkey_name: U32<LittleEndian>,
-    max_subkey_class_name: U32<LittleEndian>,
-    max_value_name: U32<LittleEndian>,
-    max_value_data: U32<LittleEndian>,
-    work_var: U32<LittleEndian>,
-    key_name_length: U16<LittleEndian>,
-    class_name_length: U16<LittleEndian>,
+    flags: u16,
+    timestamp: u64,
+    spare: u32,
+    parent: u32,
+    subkey_count: u32,
+    volatile_subkey_count: u32,
+    subkeys_list_offset: u32,
+    volatile_subkeys_list_offset: u32,
+    key_values_count: u32,
+    key_values_list_offset: u32,
+    key_security_offset: u32,
+    class_name_offset: u32,
+    max_subkey_name: u32,
+    max_subkey_class_name: u32,
+    max_value_name: u32,
+    max_value_data: u32,
+    work_var: u32,
+    key_name_length: u16,
+    class_name_length: u16,
 }
 
 /// Byte range of a single Key Node item.
@@ -80,7 +79,7 @@ struct KeyNodeItemRange {
 impl KeyNodeItemRange {
     fn from_cell_range<B>(hive: &Hive<B>, cell_range: Range<usize>) -> Result<Self>
     where
-        B: ByteSlice,
+        B:BinReaderExt
     {
         let header_range =
             byte_subrange(&cell_range, mem::size_of::<KeyNodeHeader>()).ok_or_else(|| {
@@ -103,7 +102,7 @@ impl KeyNodeItemRange {
 
     fn from_leaf_item_range<B>(hive: &Hive<B>, leaf_item_range: LeafItemRange) -> Result<Self>
     where
-        B: ByteSlice,
+        B:BinReaderExt
     {
         let key_node_offset = leaf_item_range.key_node_offset(hive);
         let cell_range = hive.cell_range_from_data_offset(key_node_offset)?;
@@ -118,7 +117,7 @@ impl KeyNodeItemRange {
         index_root_item_ranges: IndexRootItemRanges,
     ) -> Option<Result<Self>>
     where
-        B: ByteSlice,
+        B:BinReaderExt
     {
         // The following textbook binary search algorithm requires signed math.
         // Fortunately, Index Roots have a u16 `count` field, hence we should be able to convert to i32.
@@ -185,7 +184,7 @@ impl KeyNodeItemRange {
         leaf_item_ranges: LeafItemRanges,
     ) -> Option<Result<Self>>
     where
-        B: ByteSlice,
+        B:BinReaderExt
     {
         // The following textbook binary search algorithm requires signed math.
         // Fortunately, Leafs have a u16 `count` field, hence we should be able to convert to i32.
@@ -212,13 +211,15 @@ impl KeyNodeItemRange {
         None
     }
 
-    fn header<'a, B>(&self, hive: &'a Hive<B>) -> LayoutVerified<&'a [u8], KeyNodeHeader>
+    fn header<'a, B>(&self, hive: &'a Hive<B>) -> KeyNodeHeader
     where
-        B: ByteSlice,
+        B:BinReaderExt
     {
-        LayoutVerified::new(&hive.data[self.header_range.clone()]).unwrap()
+        // FIXME: delete the following statement
+        //LayoutVerified::new(&hive.data[self.header_range.clone()]).unwrap()
+        hive.data[self.header_range.clone()].unwrap()
     }
-
+/*
     fn header_mut<'a, B>(
         &self,
         hive: &'a mut Hive<B>,
@@ -228,10 +229,10 @@ impl KeyNodeItemRange {
     {
         LayoutVerified::new(&mut hive.data[self.header_range.clone()]).unwrap()
     }
-
+*/
     fn name<'a, B>(&self, hive: &'a Hive<B>) -> Result<NtHiveNameString<'a>>
     where
-        B: ByteSlice,
+        B:BinReaderExt
     {
         let header = self.header(hive);
         let flags = KeyNodeFlags::from_bits_truncate(header.flags.get());
@@ -255,7 +256,7 @@ impl KeyNodeItemRange {
 
     fn subkey<B>(&self, hive: &Hive<B>, name: &str) -> Option<Result<Self>>
     where
-        B: ByteSlice,
+        B:BinReaderExt
     {
         let cell_range = iter_try!(self.subkeys_cell_range(hive)?);
         let subkeys = iter_try!(SubKeyNodes::new(hive, cell_range));
@@ -274,7 +275,7 @@ impl KeyNodeItemRange {
 
     fn subkeys_cell_range<B>(&self, hive: &Hive<B>) -> Option<Result<Range<usize>>>
     where
-        B: ByteSlice,
+        B:BinReaderExt
     {
         let header = self.header(&hive);
         let subkeys_list_offset = header.subkeys_list_offset.get();
@@ -289,7 +290,7 @@ impl KeyNodeItemRange {
 
     fn subpath<B>(&self, hive: &Hive<B>, path: &str) -> Option<Result<Self>>
     where
-        B: ByteSlice,
+        B:BinReaderExt
     {
         let mut key_node_item_range = self.clone();
 
@@ -305,7 +306,7 @@ impl KeyNodeItemRange {
 
     fn validate_signature<B>(&self, hive: &Hive<B>) -> Result<()>
     where
-        B: ByteSlice,
+        B:BinReaderExt
     {
         let header = self.header(hive);
         let signature = &header.signature;
@@ -328,7 +329,7 @@ impl KeyNodeItemRange {
         name: &str,
     ) -> Option<Result<KeyValue<&'a Hive<B>, B>>>
     where
-        B: ByteSlice,
+        B:BinReaderExt
     {
         let mut values = iter_try!(self.values(hive)?);
 
@@ -349,7 +350,7 @@ impl KeyNodeItemRange {
 
     fn values<'a, B>(&self, hive: &'a Hive<B>) -> Option<Result<KeyValues<'a, B>>>
     where
-        B: ByteSlice,
+        B:BinReaderExt
     {
         let header = self.header(hive);
         let key_values_list_offset = header.key_values_list_offset.get();
@@ -373,7 +374,7 @@ impl KeyNodeItemRange {
 ///
 /// [`KeyValue`]: crate::key_value::KeyValue
 #[derive(Clone)]
-pub struct KeyNode<H: Deref<Target = Hive<B>>, B: ByteSlice> {
+pub struct KeyNode<H: Deref<Target = Hive<B>>, B: BinReaderExt> {
     hive: H,
     item_range: KeyNodeItemRange,
 }
@@ -381,7 +382,7 @@ pub struct KeyNode<H: Deref<Target = Hive<B>>, B: ByteSlice> {
 impl<H, B> KeyNode<H, B>
 where
     H: Deref<Target = Hive<B>>,
-    B: ByteSlice,
+    B: BinReaderExt,
 {
     pub(crate) fn from_cell_range(hive: H, cell_range: Range<usize>) -> Result<Self> {
         let item_range = KeyNodeItemRange::from_cell_range(&hive, cell_range)?;
@@ -439,15 +440,15 @@ where
 
 impl<B> PartialEq for KeyNode<&Hive<B>, B>
 where
-    B: ByteSlice,
+    B:BinReaderExt
 {
     fn eq(&self, other: &Self) -> bool {
         ptr::eq(self.hive, other.hive) && self.item_range == other.item_range
     }
 }
 
-impl<B> Eq for KeyNode<&Hive<B>, B> where B: ByteSlice {}
-
+impl<B> Eq for KeyNode<&Hive<B>, B> where B:BinReaderExt{}
+/*
 impl<H, B> KeyNode<H, B>
 where
     H: DerefMut<Target = Hive<B>>,
@@ -472,7 +473,7 @@ where
         Some(SubKeyNodesMut::new(&mut self.hive, cell_range))
     }
 }
-
+*/
 #[cfg(test)]
 mod tests {
     use crate::*;

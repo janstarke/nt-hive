@@ -5,18 +5,17 @@ use crate::error::{NtHiveError, Result};
 use crate::helpers::byte_subrange;
 use crate::hive::Hive;
 use crate::key_value::KeyValue;
-use ::byteorder::LittleEndian;
 use core::iter::FusedIterator;
 use core::mem;
 use core::ops::{Deref, Range};
-use zerocopy::*;
+use binread::{BinRead, BinReaderExt};
 
 /// On-Disk Structure of a Key Values List item.
 #[allow(dead_code)]
-#[derive(AsBytes, FromBytes, Unaligned)]
+#[derive(BinRead)]
 #[repr(packed)]
 struct KeyValuesListItem {
-    key_value_offset: U32<LittleEndian>,
+    key_value_offset: u32,
 }
 
 /// Byte range of a single Key Values list item returned by [`KeyValuesListItemRanges`].
@@ -25,10 +24,12 @@ struct KeyValuesListItemRange(Range<usize>);
 impl KeyValuesListItemRange {
     fn key_value_offset<B>(&self, hive: &Hive<B>) -> u32
     where
-        B: ByteSlice,
+        B:BinReaderExt
     {
-        let item =
-            LayoutVerified::<&[u8], KeyValuesListItem>::new(&hive.data[self.0.clone()]).unwrap();
+        // FIXME: delete the following statement
+        //let item =
+        //    LayoutVerified::<&[u8], KeyValuesListItem>::new(&hive.data[self.0.clone()]).unwrap();
+        let item: KeyValuesListItem = hive.data[self.0.clone()].read_le().unwrap();
         item.key_value_offset.get()
     }
 }
@@ -117,14 +118,14 @@ impl FusedIterator for KeyValuesListItemRanges {}
 ///
 /// On-Disk Signature: `vk`
 #[derive(Clone)]
-pub struct KeyValues<'a, B: ByteSlice> {
+pub struct KeyValues<'a, B: BinReaderExt> {
     hive: &'a Hive<B>,
     key_values_list_item_ranges: KeyValuesListItemRanges,
 }
 
 impl<'a, B> KeyValues<'a, B>
 where
-    B: ByteSlice,
+    B:BinReaderExt
 {
     pub(crate) fn new(
         hive: &'a Hive<B>,
@@ -144,7 +145,7 @@ where
 
 impl<'a, B> Iterator for KeyValues<'a, B>
 where
-    B: ByteSlice,
+    B:BinReaderExt
 {
     type Item = Result<KeyValue<&'a Hive<B>, B>>;
 
@@ -185,5 +186,5 @@ where
     }
 }
 
-impl<'a, B> ExactSizeIterator for KeyValues<'a, B> where B: ByteSlice {}
-impl<'a, B> FusedIterator for KeyValues<'a, B> where B: ByteSlice {}
+impl<'a, B> ExactSizeIterator for KeyValues<'a, B> where B:BinReaderExt{}
+impl<'a, B> FusedIterator for KeyValues<'a, B> where B:BinReaderExt{}

@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 use displaydoc::Display;
+use std::any::Any;
+use std::io;
 
 use crate::key_value::KeyValueDataType;
 
@@ -68,7 +70,35 @@ pub enum NtHiveError {
     UnsupportedKeyValueDataType { offset: usize, actual: u32 },
     /// The version in the base block ({major}.{minor}) is unsupported
     UnsupportedVersion { major: u32, minor: u32 },
+    /// any error that may occur during parsing. Because binread::error is not Clone, we use an error message instead
+    BinreadError {msg: String },
+    /// any IO error that may occur during parsing. Because io::error is not Clone, we use an error message instead
+    IOError {msg: String }
 }
 
 #[cfg(feature = "std")]
 impl std::error::Error for NtHiveError {}
+
+impl From<binread::Error> for NtHiveError {
+    fn from(error: binread::Error) -> Self {
+        match error {
+            binread::Error::Custom { pos, err } =>
+                match err.downcast_ref::<NtHiveError>() {
+                    None => panic!("unsupported error type"),
+                    Some(e) => e.clone()
+                }
+            binread::Error::BadMagic { pos, found } => Self::BinreadError{msg: format!("invalid magic at {}", pos)},
+            binread::Error::AssertFail { pos, message } => Self::BinreadError{msg: format!("assertion failed at at {}: {}", pos, message)},
+            binread::Error::Io(why) => Self::BinreadError{msg: format!("IO error: {:?}", why)},
+            binread::Error::NoVariantMatch { pos }  => Self::BinreadError{msg: format!("no variant match at {}", pos)},
+            binread::Error::EnumErrors { pos, variant_errors }  => Self::BinreadError{msg: format!("enum errors at {}", pos)},
+            err => Self::BinreadError{msg: format!("binread error: {:?}", err)}
+        }
+    }
+}
+
+impl From<io::Error> for NtHiveError {
+    fn from(error: io::Error) -> Self {
+        Self::BinreadError{msg: format!("IO error: {:?}", error)}
+    }
+}

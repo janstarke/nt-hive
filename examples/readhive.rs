@@ -6,7 +6,7 @@ use std::env;
 use std::fs::File;
 use std::io::Read;
 use std::ops::Deref;
-use zerocopy::*;
+use binread::BinRead;
 
 fn main() -> Result<(), String> {
     // Parse arguments.
@@ -40,7 +40,7 @@ fn main() -> Result<(), String> {
 fn process_subkey<H, B>(key_node: KeyNode<H, B>, level: usize) -> Result<(), String>
 where
     H: Deref<Target = Hive<B>>,
-    B: ByteSlice,
+    B:BinReaderExt
 {
     // Print the names of subkeys of this node.
     if let Some(subkeys) = key_node.subkeys() {

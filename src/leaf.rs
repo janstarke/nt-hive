@@ -7,38 +7,37 @@ use crate::hive::Hive;
 use crate::index_root::IndexRootItemRange;
 use crate::key_node::KeyNode;
 use crate::subkeys_list::SubkeysList;
-use ::byteorder::LittleEndian;
 use core::iter::FusedIterator;
 use core::mem;
 use core::ops::{Deref, Range};
-use zerocopy::*;
+use binread::{BinRead, BinReaderExt};
 
 /// On-Disk Structure of a Fast Leaf item (On-Disk Signature: `lf`).
 /// They are supported since Windows NT 4.
 #[allow(dead_code)]
-#[derive(AsBytes, FromBytes, Unaligned)]
+#[derive(BinRead)]
 #[repr(packed)]
 struct FastLeafItem {
-    key_node_offset: U32<LittleEndian>,
+    key_node_offset: u32,
     name_hint: [u8; 4],
 }
 
 /// On-Disk Structure of a Hash Leaf item (On-Disk Signature: `lh`).
 /// They are supported since Windows XP.
 #[allow(dead_code)]
-#[derive(AsBytes, FromBytes, Unaligned)]
+#[derive(BinRead)]
 #[repr(packed)]
 struct HashLeafItem {
-    key_node_offset: U32<LittleEndian>,
+    key_node_offset: u32,
     name_hash: [u8; 4],
 }
 
 /// On-Disk Structure of an Index Leaf item (On-Disk Signature: `li`).
 /// They are supported in all Windows versions.
-#[derive(AsBytes, FromBytes, Unaligned)]
+#[derive(BinRead)]
 #[repr(packed)]
 struct IndexLeafItem {
-    key_node_offset: U32<LittleEndian>,
+    key_node_offset: u32,
 }
 
 /// All known and supported Leaf types.
@@ -84,14 +83,17 @@ pub(crate) struct LeafItemRange(Range<usize>);
 impl LeafItemRange {
     pub fn key_node_offset<B>(&self, hive: &Hive<B>) -> u32
     where
-        B: ByteSlice,
+        B:BinReaderExt
     {
         // We make use of the fact that a `FastLeafItem` or `HashLeafItem` is just an
         // `IndexLeafItem` with additional fields.
         // As they all have the `key_node_offset` as their first field, treat them equally.
-        let (index_leaf_item, _) =
-            LayoutVerified::<&[u8], IndexLeafItem>::new_from_prefix(&hive.data[self.0.clone()])
-                .unwrap();
+
+        // FIXME: delete the following statement
+        // let (index_leaf_item, _) =
+        //     LayoutVerified::<&[u8], IndexLeafItem>::new_from_prefix(&hive.data[self.0.clone()])
+        //         .unwrap();
+        let index_leaf_item: IndexLeafItem = hive.data[self.0.clone()].unwrap();
         index_leaf_item.key_node_offset.get()
     }
 }
@@ -143,7 +145,7 @@ impl LeafItemRanges {
         index_root_item_range: IndexRootItemRange,
     ) -> Result<Self>
     where
-        B: ByteSlice,
+        B:BinReaderExt
     {
         let subkeys_list_offset = index_root_item_range.subkeys_list_offset(hive);
         let cell_range = hive.cell_range_from_data_offset(subkeys_list_offset)?;
@@ -212,7 +214,7 @@ impl Iterator for LeafItemRanges {
     }
 }
 
-impl<B: ByteSlice> From<LeafKeyNodes<'_, B>> for LeafItemRanges {
+impl<B: BinReaderExt> From<LeafKeyNodes<'_, B>> for LeafItemRanges {
     fn from(leaf_key_nodes: LeafKeyNodes<'_, B>) -> LeafItemRanges {
         leaf_key_nodes.leaf_item_ranges
     }
@@ -230,14 +232,14 @@ impl FusedIterator for LeafItemRanges {}
 ///
 /// [`SubKeyNodes`]: crate::subkeys_list::SubKeyNodes
 #[derive(Clone)]
-pub struct LeafKeyNodes<'a, B: ByteSlice> {
+pub struct LeafKeyNodes<'a, B: BinReaderExt> {
     hive: &'a Hive<B>,
     leaf_item_ranges: LeafItemRanges,
 }
 
 impl<'a, B> LeafKeyNodes<'a, B>
 where
-    B: ByteSlice,
+    B:BinReaderExt
 {
     pub(crate) fn new(
         hive: &'a Hive<B>,
@@ -258,7 +260,7 @@ where
 
 impl<'a, B> Iterator for LeafKeyNodes<'a, B>
 where
-    B: ByteSlice,
+    B:BinReaderExt
 {
     type Item = Result<KeyNode<&'a Hive<B>, B>>;
 
@@ -297,9 +299,10 @@ where
     }
 }
 
-impl<'a, B> ExactSizeIterator for LeafKeyNodes<'a, B> where B: ByteSlice {}
-impl<'a, B> FusedIterator for LeafKeyNodes<'a, B> where B: ByteSlice {}
+impl<'a, B> ExactSizeIterator for LeafKeyNodes<'a, B> where B:BinReaderExt{}
+impl<'a, B> FusedIterator for LeafKeyNodes<'a, B> where B:BinReaderExt{}
 
+/*
 /// Iterator over
 ///   a contiguous range of data bytes containing Leaf items of any type (Fast/Hash/Index),
 ///   returning a mutable [`KeyNode`] for each Leaf item,
@@ -342,3 +345,4 @@ where
         Some(Ok(key_node))
     }
 }
+*/

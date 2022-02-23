@@ -4,18 +4,18 @@
 use crate::error::{NtHiveError, Result};
 use crate::helpers::byte_subrange;
 use crate::key_node::KeyNode;
-use ::byteorder::LittleEndian;
 use core::convert::TryInto;
 use core::ops::Range;
 use core::{mem, u32};
 use enumn::N;
 use memoffset::offset_of;
-use zerocopy::*;
+use binread::{BinRead, BinReaderExt, PosValue};
+use std::io;
 
-#[derive(AsBytes, FromBytes, Unaligned)]
+#[derive(BinRead)]
 #[repr(packed)]
 struct CellHeader {
-    size: I32<LittleEndian>,
+    size: PosValue<i32>,
 }
 
 /// Known hive minor versions.
@@ -47,38 +47,65 @@ enum HiveFileFormats {
     Memory = 1,
 }
 
+/// this data structure follows the documentation found at
+/// <https://github.com/msuhanov/regf/blob/master/Windows%20registry%20file%20format%20specification.md#format-of-primary-files>
 #[allow(dead_code)]
-#[derive(AsBytes, FromBytes, Unaligned)]
-#[repr(packed)]
+#[derive(BinRead)]
+#[br(magic = b"regf")]
 struct HiveBaseBlock {
-    signature: [u8; 4],
-    primary_sequence_number: U32<LittleEndian>,
-    secondary_sequence_number: U32<LittleEndian>,
-    timestamp: U64<LittleEndian>,
-    major_version: U32<LittleEndian>,
-    minor_version: U32<LittleEndian>,
-    file_type: U32<LittleEndian>,
-    file_format: U32<LittleEndian>,
-    root_cell_offset: U32<LittleEndian>,
-    data_size: U32<LittleEndian>,
-    clustering_factor: U32<LittleEndian>,
-    file_name: [U16<LittleEndian>; 32],
-    padding_1: [u8; 396],
-    checksum: U32<LittleEndian>,
-    padding_2: [u8; 3576],
-    boot_type: U32<LittleEndian>,
-    boot_recover: U32<LittleEndian>,
+    primary_sequence_number: PosValue<u32>,
+    secondary_sequence_number: PosValue<u32>,
+    timestamp: PosValue<u64>,
+
+    #[br(assert(major_version==1))]
+    major_version: PosValue<u32>,
+
+    #[br(assert(vec![3, 4, 5, 6].contains(&*minor_version)))]
+    minor_version: PosValue<u32>,
+
+    #[br(assert(*file_type==1 || *file_type==2))]
+    file_type: PosValue<u32>,
+
+    #[br(assert(*file_format==1))]
+    file_format: PosValue<u32>,
+    root_cell_offset: PosValue<u32>,
+
+    #[br(assert(*data_size%4096 == 0))]
+    data_size: PosValue<u32>,
+    clustering_factor: PosValue<u32>,
+    file_name: PosValue<[u16; 32]>,
+    #[br(count=99)]
+    padding_1: PosValue<Vec<u32>>,
+    checksum: PosValue<u32>,
+    #[br(count=0x37E)]
+    padding_2: PosValue<Vec<u32>>,
+    boot_type: PosValue<u32>,
+    boot_recover: PosValue<u32>,
+}
+
+
+#[derive(BinRead)]
+#[br(magic = b"hbin")]
+struct HiveBin {
+    offset: u32,
+
+    #[br(assert(size%4096 == 0))]
+    size: u32,
+    reserved: u64,
+    timestamp: u64,
+    spare: u32
 }
 
 /// Root structure describing a registry hive.
-pub struct Hive<B: ByteSlice> {
-    base_block: LayoutVerified<B, HiveBaseBlock>,
+pub struct Hive<B: BinReaderExt> {
+    base_block: HiveBaseBlock,
+    data_len: usize,
     pub(crate) data: B,
 }
 
 impl<B> Hive<B>
 where
-    B: ByteSlice,
+    B: BinReaderExt,
 {
     /// Creates a new `Hive` from any byte slice.
     /// Performs basic validation and rejects any invalid hive.
@@ -96,16 +123,11 @@ where
     /// This is a solution for accessing parts of hives that have not been fully flushed to disk
     /// (e.g. due to hibernation and mismatching sequence numbers).
     pub fn without_validation(bytes: B) -> Result<Self> {
-        let length = bytes.len();
-        let (base_block, data) = LayoutVerified::new_from_prefix(bytes).ok_or_else(|| {
-            NtHiveError::InvalidHeaderSize {
-                offset: 0,
-                expected: mem::size_of::<HiveBaseBlock>(),
-                actual: length,
-            }
-        })?;
+        let data_len = bytes.seek(io::SeekFrom::End(0)).unwrap() as usize;
+        bytes.seek(io::SeekFrom::Start(0)).unwrap();
+        let base_block: HiveBaseBlock = bytes.read_le()?;
 
-        let hive = Self { base_block, data };
+        let hive = Self { base_block, data: bytes, data_len };
         Ok(hive)
     }
 
@@ -117,25 +139,20 @@ where
         // slice range operations and fearless calculations.
         let data_offset = data_offset as usize;
 
-        // Get the cell header.
-        let remaining_range = data_offset..self.data.len();
-        let header_range = byte_subrange(&remaining_range, mem::size_of::<CellHeader>())
-            .ok_or_else(|| NtHiveError::InvalidHeaderSize {
-                offset: self.offset_of_data_offset(data_offset),
-                expected: mem::size_of::<CellHeader>(),
-                actual: remaining_range.len(),
-            })?;
-        let cell_data_offset = header_range.end;
-
         // After the check above, the following operation must succeed, so we can just `unwrap`.
-        let header = LayoutVerified::<&[u8], CellHeader>::new(&self.data[header_range]).unwrap();
-        let cell_size = header.size.get();
+        //
+        // FIXME: remove the following line
+        // let header = LayoutVerified::<&[u8], CellHeader>::new(&self.data[header_range]).unwrap();
+        self.data.seek(io::SeekFrom::Start(data_offset as u64))?;
+        let header: CellHeader = self.data.read_le()?;
+        let cell_size = header.size;
+        let cell_data_offset = self.data.seek(io::SeekFrom::Current(0))? as usize;
 
         // A cell with size > 0 is unallocated and shouldn't be processed any further by us.
-        if cell_size > 0 {
+        if *cell_size > 0 {
             return Err(NtHiveError::UnallocatedCell {
                 offset: self.offset_of_data_offset(data_offset),
-                size: cell_size,
+                size: *cell_size,
             });
         }
         let cell_size = cell_size.abs() as usize;
@@ -151,7 +168,7 @@ where
         }
 
         // Get the actual data range and verify that it's inside our hive data.
-        let remaining_range = cell_data_offset..self.data.len();
+        let remaining_range = cell_data_offset..self.data_len;
         let cell_data_range = byte_subrange(&remaining_range, cell_size).ok_or_else(|| {
             NtHiveError::InvalidSizeField {
                 offset: self.offset_of_field(&header.size),
@@ -168,12 +185,15 @@ where
     /// Note that this function primarily exists to provide absolute hive file offsets when reporting errors.
     /// It cannot be used to index into the hive bytes, because they are initially split into `base_block`
     /// and `data`.
-    pub(crate) fn offset_of_field<T>(&self, field: &T) -> usize {
-        let field_address = field as *const T as usize;
+    pub(crate) fn offset_of_field<T>(&self, field: &PosValue<T>) -> usize {
+        let field_address = field.pos as usize;
+        /*
         let base_address = self.base_block.bytes().as_ptr() as usize;
 
         assert!(field_address > base_address);
         field_address - base_address
+        */
+        field_address
     }
 
     /// Calculate a data offset's offset from the very beginning of the hive bytes.
@@ -185,20 +205,20 @@ where
     ///
     /// The only known value is `1`.
     pub fn major_version(&self) -> u32 {
-        self.base_block.major_version.get()
+        *self.base_block.major_version
     }
 
     /// Returns the minor version of this hive.
     ///
     /// You can feed this value to [`HiveMinorVersion::n`] to find out whether this is a known version.
     pub fn minor_version(&self) -> u32 {
-        self.base_block.minor_version.get()
+        *self.base_block.minor_version
     }
 
     /// Returns the root [`KeyNode`] of this hive.
     pub fn root_key_node(&self) -> Result<KeyNode<&Self, B>> {
-        let root_cell_offset = self.base_block.root_cell_offset.get();
-        let cell_range = self.cell_range_from_data_offset(root_cell_offset)?;
+        let root_cell_offset = self.base_block.root_cell_offset;
+        let cell_range = self.cell_range_from_data_offset(*root_cell_offset)?;
         KeyNode::from_cell_range(self, cell_range)
     }
 
@@ -207,17 +227,16 @@ where
     /// If you read the hive via [`Hive::new`], these validations have already been performed.
     /// This function is only relevant for hives opened via [`Hive::without_validation`].
     pub fn validate(&self) -> Result<()> {
-        self.validate_signature()?;
         self.validate_sequence_numbers()?;
         self.validate_version()?;
         self.validate_file_type()?;
         self.validate_file_format()?;
-        self.validate_data_size()?;
+        //self.validate_data_size()?;
         self.validate_clustering_factor()?;
-        self.validate_checksum()?;
+        //self.validate_checksum()?;
         Ok(())
     }
-
+/*
     fn validate_checksum(&self) -> Result<()> {
         let checksum_offset = offset_of!(HiveBaseBlock, checksum);
 
@@ -236,7 +255,7 @@ where
         }
 
         // Compare the calculated checksum with the stored one.
-        let checksum = self.base_block.checksum.get();
+        let checksum = self.base_block.checksum;
         if checksum == calculated_checksum {
             Ok(())
         } else {
@@ -246,9 +265,9 @@ where
             })
         }
     }
-
+*/
     fn validate_clustering_factor(&self) -> Result<()> {
-        let clustering_factor = self.base_block.clustering_factor.get();
+        let clustering_factor = self.base_block.clustering_factor;
         let expected_clustering_factor = 1;
 
         if clustering_factor == expected_clustering_factor {
@@ -256,13 +275,13 @@ where
         } else {
             Err(NtHiveError::UnsupportedClusteringFactor {
                 expected: expected_clustering_factor,
-                actual: clustering_factor,
+                actual: *clustering_factor,
             })
         }
     }
-
+/*
     fn validate_data_size(&self) -> Result<()> {
-        let data_size = self.base_block.data_size.get() as usize;
+        let data_size = self.base_block.data_size as usize;
         let expected_alignment = 4096;
 
         // The data size must be a multiple of 4096 bytes
@@ -285,9 +304,9 @@ where
 
         Ok(())
     }
-
+*/
     fn validate_file_format(&self) -> Result<()> {
-        let file_format = self.base_block.file_format.get();
+        let file_format = self.base_block.file_format;
         let expected_file_format = HiveFileFormats::Memory as u32;
 
         if file_format == expected_file_format {
@@ -295,13 +314,13 @@ where
         } else {
             Err(NtHiveError::UnsupportedFileFormat {
                 expected: expected_file_format,
-                actual: file_format,
+                actual: *file_format,
             })
         }
     }
 
     fn validate_file_type(&self) -> Result<()> {
-        let file_type = self.base_block.file_type.get();
+        let file_type = self.base_block.file_type;
         let expected_file_type = HiveFileTypes::Primary as u32;
 
         if file_type == expected_file_type {
@@ -309,36 +328,21 @@ where
         } else {
             Err(NtHiveError::UnsupportedFileType {
                 expected: expected_file_type,
-                actual: file_type,
+                actual: *file_type,
             })
         }
     }
 
     fn validate_sequence_numbers(&self) -> Result<()> {
-        let primary_sequence_number = self.base_block.primary_sequence_number.get();
-        let secondary_sequence_number = self.base_block.secondary_sequence_number.get();
+        let primary_sequence_number = self.base_block.primary_sequence_number;
+        let secondary_sequence_number = self.base_block.secondary_sequence_number;
 
-        if primary_sequence_number == secondary_sequence_number {
+        if primary_sequence_number == *secondary_sequence_number {
             Ok(())
         } else {
             Err(NtHiveError::SequenceNumberMismatch {
-                primary: primary_sequence_number,
-                secondary: secondary_sequence_number,
-            })
-        }
-    }
-
-    fn validate_signature(&self) -> Result<()> {
-        let signature = &self.base_block.signature;
-        let expected_signature = b"regf";
-
-        if signature == expected_signature {
-            Ok(())
-        } else {
-            Err(NtHiveError::InvalidFourByteSignature {
-                offset: self.offset_of_field(signature),
-                expected: expected_signature,
-                actual: *signature,
+                primary: *primary_sequence_number,
+                secondary: *secondary_sequence_number,
             })
         }
     }
@@ -353,38 +357,23 @@ where
             Err(NtHiveError::UnsupportedVersion { major, minor })
         }
     }
-}
 
-impl<B> Hive<B>
-where
-    B: ByteSliceMut,
-{
-    /// Clears the `volatile_subkey_count` field of all key nodes recursively.
-    ///
-    /// This needs to be done before passing the hive to an NT kernel during boot.
-    /// See <https://github.com/reactos/reactos/pull/1883> for more information.
-    pub fn clear_volatile_subkeys(&mut self) -> Result<()> {
-        let mut root_key_node = self.root_key_node_mut()?;
-        root_key_node.clear_volatile_subkeys()
-    }
-
-    pub(crate) fn root_key_node_mut(&mut self) -> Result<KeyNode<&mut Self, B>> {
-        let root_cell_offset = self.base_block.root_cell_offset.get();
-        let cell_range = self.cell_range_from_data_offset(root_cell_offset)?;
-        KeyNode::from_cell_range(self, cell_range)
+    fn enum_subkeys(&self, f: fn (&KeyNode<&Hive<B>, B>) -> Result<()>) -> Result<()> {
+        let root_key_node = self.root_key_node()?;
+        f(&root_key_node)?;
+        Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use crate::*;
+    use std::io;
 
     #[test]
-    fn test_clear_volatile_subkeys() {
-        // clear_volatile_subkeys traverses all subkeys, so this test just checks
-        // that it doesn't crash during that process.
-        let mut testhive = crate::helpers::tests::testhive_vec();
-        let mut hive = Hive::new(testhive.as_mut()).unwrap();
-        assert!(hive.clear_volatile_subkeys().is_ok());
+    fn enum_subkeys() {
+        let testhive = crate::helpers::tests::testhive_vec();
+        let hive = Hive::new(io::Cursor::new(testhive)).unwrap();
+        assert!(hive.enum_subkeys(|k| Ok(())).is_ok());
     }
 }

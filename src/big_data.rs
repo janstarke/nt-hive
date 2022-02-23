@@ -4,12 +4,12 @@
 use crate::error::{NtHiveError, Result};
 use crate::helpers::byte_subrange;
 use crate::hive::Hive;
-use ::byteorder::LittleEndian;
 use core::cmp;
 use core::iter::FusedIterator;
 use core::mem;
 use core::ops::{Deref, Range};
-use zerocopy::*;
+use binread::{BinRead, BinReaderExt, PosValue};
+use std::io;
 
 /// Number of bytes that a single Big Data segment can hold.
 /// Every Big Data segment contains that many data bytes except for the last one.
@@ -20,32 +20,37 @@ use zerocopy::*;
 pub(crate) const BIG_DATA_SEGMENT_SIZE: usize = 16344;
 
 /// On-Disk Structure of a Big Data header.
-#[derive(AsBytes, FromBytes, Unaligned)]
+#[derive(BinRead)]
 #[repr(packed)]
+#[br(magic = b"db")]
 struct BigDataHeader {
-    signature: [u8; 2],
-    segment_count: U16<LittleEndian>,
-    segment_list_offset: U32<LittleEndian>,
+    segment_count: PosValue<u16>,
+    segment_list_offset: PosValue<u32>,
 }
 
 /// On-Disk Structure of a Big Data list item.
-#[derive(AsBytes, FromBytes, Unaligned)]
+#[derive(BinRead)]
 #[repr(packed)]
 struct BigDataListItem {
-    segment_offset: U32<LittleEndian>,
+    segment_offset: u32,
 }
 
 /// Byte range of a single Big Data list item returned by [`BigDataListItemRanges`].
 struct BigDataListItemRange(Range<usize>);
 
 impl BigDataListItemRange {
-    fn segment_offset<B>(&self, hive: &Hive<B>) -> u32
+    fn segment_offset<B>(&self, hive: &Hive<B>) -> Result<u32>
     where
-        B: ByteSlice,
+        B:BinReaderExt
     {
-        let item =
-            LayoutVerified::<&[u8], BigDataListItem>::new(&hive.data[self.0.clone()]).unwrap();
-        item.segment_offset.get()
+        // FIXME: delete the following statement
+        //let item =
+        //    LayoutVerified::<&[u8], BigDataListItem>::new(&hive.data[self.0.clone()]).unwrap();
+
+        hive.data.seek(io::SeekFrom::Start(self.0.start as u64))?;
+        let item: BigDataListItem = hive.data.read_le()?;
+
+        Ok(item.segment_offset)
     }
 }
 
@@ -75,7 +80,7 @@ impl BigDataListItemRanges {
         header_cell_range: Range<usize>,
     ) -> Result<Self>
     where
-        B: ByteSlice,
+        B:BinReaderExt
     {
         let data_size = data_size as usize;
 
@@ -88,12 +93,14 @@ impl BigDataListItemRanges {
                 actual: header_cell_range.len(),
             })?;
 
-        let header = LayoutVerified::new(&hive.data[header_range]).unwrap();
-        Self::validate_signature(&hive, &header)?;
+        // FIXME: delete the following statement
+        //let header = LayoutVerified::new(&hive.data[header_range]).unwrap();
+        hive.data.seek(io::SeekFrom::Start(header_range.start as u64))?;
+        let header: BigDataHeader = hive.data.read_le()?;
 
         // Check the `segment_count` of the `BigDataHeader`.
         // Verify that we have enough segments to contain the entire data.
-        let segment_count = header.segment_count.get();
+        let segment_count = *header.segment_count;
         let max_data_size = segment_count as usize * BIG_DATA_SEGMENT_SIZE;
         if data_size > max_data_size {
             return Err(NtHiveError::InvalidSizeField {
@@ -104,7 +111,7 @@ impl BigDataListItemRanges {
         }
 
         // Get the Big Data segment list referenced by the `segment_list_offset`.
-        let segment_list_offset = header.segment_list_offset.get();
+        let segment_list_offset = *header.segment_list_offset;
         let segment_list_cell_range = hive.cell_range_from_data_offset(segment_list_offset)?;
 
         // Finally calculate the range of Big Data list items we want to iterate over.
@@ -119,27 +126,6 @@ impl BigDataListItemRanges {
         })?;
 
         Ok(Self { items_range })
-    }
-
-    fn validate_signature<B>(
-        hive: &Hive<B>,
-        header: &LayoutVerified<&[u8], BigDataHeader>,
-    ) -> Result<()>
-    where
-        B: ByteSlice,
-    {
-        let signature = &header.signature;
-        let expected_signature = b"db";
-
-        if signature == expected_signature {
-            Ok(())
-        } else {
-            Err(NtHiveError::InvalidTwoByteSignature {
-                offset: hive.offset_of_field(signature),
-                expected: expected_signature,
-                actual: *signature,
-            })
-        }
     }
 }
 
@@ -192,7 +178,7 @@ impl FusedIterator for BigDataListItemRanges {}
 ///
 /// [`KeyValueData`]: crate::key_value::KeyValueData
 #[derive(Clone)]
-pub struct BigDataSlices<'a, B: ByteSlice> {
+pub struct BigDataSlices<'a, B: BinReaderExt> {
     hive: &'a Hive<B>,
     big_data_list_item_ranges: BigDataListItemRanges,
     bytes_left: usize,
@@ -200,7 +186,7 @@ pub struct BigDataSlices<'a, B: ByteSlice> {
 
 impl<'a, B> BigDataSlices<'a, B>
 where
-    B: ByteSlice,
+    B:BinReaderExt
 {
     pub(crate) fn new(
         hive: &'a Hive<B>,
@@ -221,9 +207,9 @@ where
 
 impl<'a, B> Iterator for BigDataSlices<'a, B>
 where
-    B: ByteSlice,
+    B:BinReaderExt
 {
-    type Item = Result<&'a [u8]>;
+    type Item = Result<usize>;
 
     fn next(&mut self) -> Option<Self::Item> {
         // Every segment contains BIG_DATA_SEGMENT_SIZE bytes of data except for the last one.
@@ -234,7 +220,7 @@ where
 
         // Get the next segment offset and adjust `bytes_left` accordingly.
         let big_data_list_item_range = self.big_data_list_item_ranges.next()?;
-        let segment_offset = big_data_list_item_range.segment_offset(&self.hive);
+        let segment_offset = big_data_list_item_range.segment_offset(&self.hive).unwrap();
         self.bytes_left -= bytes_to_return;
 
         // Get the cell belonging to that offset and check if it contains as many bytes
@@ -249,7 +235,7 @@ where
         }));
 
         // Return a byte slice containing this segment's data.
-        Some(Ok(&self.hive.data[data_range]))
+        Some(Ok(data_range.start))
     }
 
     fn count(self) -> usize {
@@ -285,17 +271,18 @@ where
     }
 }
 
-impl<'a, B> ExactSizeIterator for BigDataSlices<'a, B> where B: ByteSlice {}
-impl<'a, B> FusedIterator for BigDataSlices<'a, B> where B: ByteSlice {}
+impl<'a, B> ExactSizeIterator for BigDataSlices<'a, B> where B:BinReaderExt{}
+impl<'a, B> FusedIterator for BigDataSlices<'a, B> where B:BinReaderExt{}
 
 #[cfg(test)]
 mod tests {
     use crate::*;
+    use std::io;
 
     #[test]
     fn test_big_data() {
         let testhive = crate::helpers::tests::testhive_vec();
-        let hive = Hive::new(testhive.as_ref()).unwrap();
+        let hive = Hive::new(io::Cursor::new(testhive)).unwrap();
         let root_key_node = hive.root_key_node().unwrap();
         let key_node = root_key_node.subkey("big-data-test").unwrap().unwrap();
 
